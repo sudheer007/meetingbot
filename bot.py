@@ -13,6 +13,7 @@ class JitsiBot:
         self.options = Options()
         
         # Add required Chrome options
+        self.options.add_argument("--headless")  # Enable headless mode
         self.options.add_argument("--use-fake-ui-for-media-stream")
         self.options.add_argument("--use-file-for-fake-audio-capture")
         self.options.add_argument("--allow-file-access")
@@ -59,6 +60,21 @@ class JitsiBot:
             print(f"Joining meeting at: {MEETING_URL}")
             self.driver.get(MEETING_URL)
             
+            # Wait for the name input field to be present and enter the bot's name
+            name_input = WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#premeeting-name-input"))
+            )
+            name_input.clear()  # Clear any existing text
+            name_input.send_keys(BOT_NAME)  # Enter the bot's name
+            print(f"Entered bot name: {BOT_NAME}")
+            
+            # Disable the video button
+            video_button = WebDriverWait(self.driver, 20).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, ".toolbox-button[aria-label='Stop camera']"))
+            )
+            video_button.click()  # Click to disable the video
+            print("Disabled video button")
+            
             # Click join button using the data-testid
             join_button = WebDriverWait(self.driver, 20).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='prejoin.joinMeeting']"))
@@ -83,6 +99,40 @@ class JitsiBot:
                 
                 if join_status and join_status['isJoined']:
                     print(f"Successfully joined the meeting. Status: {join_status}")
+                    
+                    # Hide all visual elements
+                    self.driver.execute_script("""
+                        // Wait for the conference to be ready
+                        const checkConferenceReady = setInterval(() => {
+                            if (window.APP && window.APP.conference && window.APP.conference._room) {
+                                clearInterval(checkConferenceReady);
+                                
+                                // Hide all participant video elements
+                                const videoElements = document.querySelectorAll('video');
+                                videoElements.forEach(video => {
+                                    video.style.display = 'none';  // Hide video elements
+                                });
+
+                                // Hide all participant elements except for the bot's name
+                                const localParticipant = window.APP.conference._room.getLocalParticipant();
+                                const botName = localParticipant.getDisplayName();
+                                const participantElements = document.querySelectorAll('.participant');
+
+                                participantElements.forEach(element => {
+                                    if (!element.innerText.includes(botName)) {
+                                        element.style.display = 'none';
+                                    }
+                                });
+
+                                // Optionally hide other UI elements
+                                const uiElements = document.querySelectorAll('.some-ui-class'); // Replace with actual classes to hide
+                                uiElements.forEach(element => {
+                                    element.style.display = 'none';
+                                });
+                            }
+                        }, 1000);  // Check every 100ms
+                    """)
+                    
                     break
                     
                 time.sleep(1)
@@ -216,7 +266,7 @@ class JitsiBot:
                 });
 
                 // Start recording with smaller chunks for more frequent saves
-                window.mediaRecorder.start(500);  // Create chunks every 500ms
+                window.mediaRecorder.start(5000);  // Create chunks every 500ms
                 console.log("MediaRecorder started");
 
                 return {
