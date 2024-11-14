@@ -4,8 +4,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
-from datetime import datetime
 import os
+import speech_recognition as sr
+import threading
 from config import MEETING_URL, BOT_NAME
 
 class JitsiBot:
@@ -28,6 +29,9 @@ class JitsiBot:
         self.options.add_argument('--disable-dev-shm-usage')
         self.options.add_argument("--use-fake-device-for-media-stream")
         
+        self.recognizer = sr.Recognizer()  # Initialize the recognizer
+        self.transcription_thread = None  # Thread for transcription
+
         # Enable audio recording
         self.options.add_argument("--enable-usermedia-screen-capturing")
         self.options.add_argument("--allow-file-access-from-files")
@@ -55,6 +59,9 @@ class JitsiBot:
             seleniumwire_options=seleniumwire_options
         )
         
+        self.participants = {}  # Dictionary to keep track of participants
+        self.current_speaker = None  # Variable to track the current speaker
+
     def join_meeting(self):
         try:
             print(f"Joining meeting at: {MEETING_URL}")
@@ -102,18 +109,15 @@ class JitsiBot:
                     
                     # Hide all visual elements
                     self.driver.execute_script("""
-                        // Wait for the conference to be ready
                         const checkConferenceReady = setInterval(() => {
                             if (window.APP && window.APP.conference && window.APP.conference._room) {
                                 clearInterval(checkConferenceReady);
                                 
-                                // Hide all participant video elements
                                 const videoElements = document.querySelectorAll('video');
                                 videoElements.forEach(video => {
                                     video.style.display = 'none';  // Hide video elements
                                 });
 
-                                // Hide all participant elements except for the bot's name
                                 const localParticipant = window.APP.conference._room.getLocalParticipant();
                                 const botName = localParticipant.getDisplayName();
                                 const participantElements = document.querySelectorAll('.participant');
@@ -122,12 +126,6 @@ class JitsiBot:
                                     if (!element.innerText.includes(botName)) {
                                         element.style.display = 'none';
                                     }
-                                });
-
-                                // Optionally hide other UI elements
-                                const uiElements = document.querySelectorAll('.some-ui-class'); // Replace with actual classes to hide
-                                uiElements.forEach(element => {
-                                    element.style.display = 'none';
                                 });
                             }
                         }, 1000);  // Check every 100ms
@@ -142,10 +140,15 @@ class JitsiBot:
             
             # Additional wait for audio setup
             time.sleep(5)
-            print("Starting recording...")
+            print("Starting transcription...")
+
+            # Start the transcription in a separate thread
+            self.start_transcription()
             
+            #time.sleep(5)
+            #print("Starting recording...")
             # Start recording
-            self.start_recording()
+            #self.start_recording()
             
             # Keep the bot in the meeting and monitor status
             while True:
@@ -164,7 +167,59 @@ class JitsiBot:
         except Exception as e:
             print(f"Error in join_meeting: {e}")
             self.driver.quit()
-            
+    
+    def start_transcription(self):
+        """Start a thread to capture and transcribe audio."""
+        self.transcription_thread = threading.Thread(target=self.transcribe_audio)
+        self.transcription_thread.start()
+
+    def transcribe_audio(self):
+        """Capture audio and transcribe it in real-time."""
+        with sr.Microphone() as source:
+            print("Listening for audio...")
+            while True:
+                try:
+                    # Adjust for ambient noise and listen for audio
+                    self.recognizer.adjust_for_ambient_noise(source)
+                    audio = self.recognizer.listen(source, timeout=5)  # Listen for audio
+                    print("Recognizing...")
+                    # Use Google Web Speech API to transcribe audio
+                    text = self.recognizer.recognize_google(audio)
+
+                    # Get the current speaker's name from the DOM
+                    current_speaker_name = self.driver.execute_script("""
+                        const nameElement = document.querySelector('#localDisplayName');
+                        return nameElement ? nameElement.innerText : 'Unknown Speaker';
+                    """)
+
+                    # Log the transcription with participant name
+                    log_entry = f"{current_speaker_name}: {text}"
+                    print(log_entry)  # Print the transcription
+                    with open("transcript.txt", "a") as f:
+                        f.write(log_entry + "\n")  # Log the transcription to a file
+
+                except sr.WaitTimeoutError:
+                    print("Listening timed out while waiting for phrase to start")
+                except sr.UnknownValueError:
+                    print("Google Speech Recognition could not understand audio")
+                except sr.RequestError as e:
+                    print(f"Could not request results from Google Speech Recognition service; {e}")
+                except Exception as e:
+                    print(f"Error during transcription: {e}")
+
+    def identify_speaker(self, participant_id):
+        """Identify the speaker based on participant ID."""
+        # Assuming you have a mapping of participant IDs to names
+        if participant_id in self.participants:
+            self.current_speaker = self.participants[participant_id]  # Get the name from the mapping
+        else:
+            self.current_speaker = "Unknown Speaker"
+
+    def stop_transcription(self):
+        """Stop the transcription thread."""
+        if self.transcription_thread is not None:
+            self.transcription_thread.join()
+
     def start_recording(self):
         try:
             recordings_dir = os.path.join(os.getcwd(), "recordings")
@@ -185,24 +240,15 @@ class JitsiBot:
                 // Initialize audio chunks array
                 window.audioChunks = [];
                 
-                let tracksAdded = 0;
-                
-                // Function to get audio stream from participant
-                const getParticipantAudioStream = (participant) => {
-                    const tracks = participant.getTracks();
-                    const audioTrack = tracks.find(t => t.getType() === 'audio');
-                    return audioTrack ? audioTrack.stream : null;
-                };
-
                 // Function to add stream to recording
-                const addStreamToRecording = (stream) => {
+                const addStreamToRecording = (stream, participantName) => {
                     if (stream && stream.getAudioTracks().length > 0) {
                         const source = audioContext.createMediaStreamSource(stream);
                         const gainNode = audioContext.createGain();
                         gainNode.gain.value = 1.0;  // Adjust volume if needed
                         source.connect(gainNode);
                         gainNode.connect(destination);
-                        console.log('Added audio stream to recording');
+                        console.log('Added audio stream to recording for participant: ' + participantName);
                         return true;
                     }
                     return false;
@@ -210,27 +256,21 @@ class JitsiBot:
 
                 // Add remote participants' audio
                 conference.getParticipants().forEach(participant => {
-                    const stream = getParticipantAudioStream(participant);
+                    const stream = participant.getTracks().find(t => t.getType() === 'audio')?.stream;
                     if (stream) {
-                        if (addStreamToRecording(stream)) {
-                            tracksAdded++;
-                            console.log(`Added audio for participant: ${participant.getId()}`);
-                        }
+                        const participantName = participant.getDisplayName();
+                        addStreamToRecording(stream, participantName);
                     }
                 });
 
-                // Create a combined stream for recording
-                const combinedStream = destination.stream;
-                console.log(`Combined stream tracks: ${combinedStream.getAudioTracks().length}`);
-
                 // Set up MediaRecorder
+                const combinedStream = destination.stream;
                 window.mediaRecorder = new MediaRecorder(combinedStream, {
                     mimeType: 'audio/webm;codecs=opus',
                     audioBitsPerSecond: 128000
                 });
 
                 window.mediaRecorder.ondataavailable = (event) => {
-                    console.log(`Data available event, size: ${event.data.size}`);
                     if (event.data.size > 0) {
                         window.audioChunks.push(event.data);
                     }
@@ -240,38 +280,28 @@ class JitsiBot:
                     console.log('MediaRecorder stopped, processing chunks...');
                     if (window.audioChunks.length > 0) {
                         const blob = new Blob(window.audioChunks, { type: 'audio/webm' });
-                        console.log(`Creating blob of size: ${blob.size}`);
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
                         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                        a.href = url;
-                        a.download = `meeting_recording_${timestamp}.webm`;
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                        console.log(`Recording saved with ${window.audioChunks.length} chunks`);
+                        const filePath = `${recordings_dir}/meeting_recording_${timestamp}.webm`;
+                        const fileReader = new FileReader();
+                        fileReader.onload = function() {
+                            const arrayBuffer = this.result;
+                            const buffer = new Uint8Array(arrayBuffer);
+                            const fs = require('fs');
+                            fs.writeFileSync(filePath, buffer);
+                            console.log(`Recording saved at: ${filePath}`);
+                        };
+                        fileReader.readAsArrayBuffer(blob);
                     } else {
                         console.log('No audio chunks recorded');
                     }
                 };
 
-                // Handle new participants
-                conference.on('track.added', (track) => {
-                    if (track.getType() === 'audio' && track.stream) {
-                        if (addStreamToRecording(track.stream)) {
-                            tracksAdded++;
-                            console.log('New audio track added to recording');
-                        }
-                    }
-                });
-
-                // Start recording with smaller chunks for more frequent saves
-                window.mediaRecorder.start(5000);  // Create chunks every 500ms
+                // Start recording
+                window.mediaRecorder.start(5000);  // Create chunks every 5000ms
                 console.log("MediaRecorder started");
 
                 return {
                     status: 'started',
-                    tracksAdded: tracksAdded,
                     recorderState: window.mediaRecorder.state,
                     streamTracks: combinedStream.getAudioTracks().length
                 };
@@ -319,15 +349,21 @@ class JitsiBot:
                     // Force save current chunks if any exist
                     if (window.audioChunks && window.audioChunks.length > 0) {
                         const blob = new Blob(window.audioChunks, { type: 'audio/webm' });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
                         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                        a.href = url;
-                        a.download = `meeting_recording_${timestamp}.webm`;
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                        console.log(`Final recording saved with ${window.audioChunks.length} chunks`);
+                        const filePath = `${recordings_dir}/meeting_recording_${timestamp}.webm`;
+                        
+                        // Create a FileReader to read the Blob
+                        const fileReader = new FileReader();
+                        fileReader.onload = function() {
+                            const arrayBuffer = this.result;
+                            const buffer = new Uint8Array(arrayBuffer);
+                            const fs = require('fs');
+                            fs.writeFileSync(filePath, buffer);
+                            console.log(`Recording saved at: ${filePath}`);
+                        };
+                        fileReader.readAsArrayBuffer(blob);
+                    } else {
+                        console.log('No audio chunks recorded');
                     }
                     
                     if (window.audioContext) {
@@ -341,6 +377,8 @@ class JitsiBot:
                 return false;
             }
             """
+            
+            # Execute the stop script
             stopped = self.driver.execute_script(stop_script)
             time.sleep(3)  # Give time for the file to save
             print(f"Recording {'stopped' if stopped else 'was already stopped'}")
@@ -350,6 +388,7 @@ class JitsiBot:
     def quit(self):
         try:
             print("\nShutting down bot...")
+            self.stop_transcription()  # Stop the transcription thread
             self.stop_recording()
             time.sleep(3)  # Give more time for the recording to save
             self.driver.quit()
@@ -369,6 +408,10 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping bot...")
         bot.quit()
+    finally:
+        # Ensure that the transcription thread is stopped if it is still running
+        if bot.transcription_thread is not None and bot.transcription_thread.is_alive():
+            bot.stop_transcription()
 
 if __name__ == "__main__":
     main()
