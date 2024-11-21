@@ -8,6 +8,9 @@ import os
 import speech_recognition as sr
 import threading
 from config import MEETING_URL, BOT_NAME
+import pyaudio
+import wave
+from datetime import datetime
 
 class JitsiBot:
     def __init__(self):
@@ -106,6 +109,8 @@ class JitsiBot:
                 
                 if join_status and join_status['isJoined']:
                     print(f"Successfully joined the meeting. Status: {join_status}")
+                    print("Starting recording...")
+                    self.start_recording_v2() 
                     
                     # Hide all visual elements
                     self.driver.execute_script("""
@@ -173,6 +178,82 @@ class JitsiBot:
         self.transcription_thread = threading.Thread(target=self.transcribe_audio)
         self.transcription_thread.start()
 
+        
+    def start_recording_v2(self):
+        self.recording_thread = threading.Thread(target=self.record_audio)
+        self.recording_thread.start()
+    
+    def record_audio(self):
+        """Record audio from the meeting continuously using PyAudio."""
+        CHUNK = 1024
+        FORMAT = pyaudio.paInt16
+        CHANNELS = 1
+        RATE = 44100
+        RECORD_SECONDS = 20  # Duration of each chunk in seconds
+        
+        recordings_dir = os.path.join(os.getcwd(), "recordings")
+        if not os.path.exists(recordings_dir):
+            os.makedirs(recordings_dir)
+
+        p = pyaudio.PyAudio()
+        
+        # Find the correct input device (virtual audio cable or system audio)
+        device_index = None
+        for i in range(p.get_device_count()):
+            device_info = p.get_device_info_by_index(i)
+            print(f"Device {i}: {device_info['name']}")
+            # You might want to adjust this condition based on your system's audio setup
+            if "virtual" in device_info['name'].lower() or "stereo mix" in device_info['name'].lower():
+                device_index = i
+                break
+        
+        if device_index is None:
+            print("Using default input device")
+        
+        stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    input_device_index=device_index,
+                    frames_per_buffer=CHUNK)
+
+        print("Started recording audio with PyAudio...")
+        
+        try:
+            while True:
+                frames = []
+                for i in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
+                    try:
+                        data = stream.read(CHUNK)
+                        frames.append(data)
+                    except Exception as e:
+                        print(f"Error reading chunk: {e}")
+                        continue
+
+                # Generate timestamp for the filename
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                filename = os.path.join(recordings_dir, f"audio_chunk_{timestamp}.wav")
+
+                # Save the audio chunk
+                try:
+                    wf = wave.open(filename, 'wb')
+                    wf.setnchannels(CHANNELS)
+                    wf.setsampwidth(p.get_sample_size(FORMAT))
+                    wf.setframerate(RATE)
+                    wf.writeframes(b''.join(frames))
+                    wf.close()
+                    print(f"Saved audio chunk: {filename}")
+                except Exception as e:
+                    print(f"Error saving audio file: {e}")
+
+        except Exception as e:
+            print(f"Error in recording: {e}")
+        finally:
+            # Clean up
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+            
     def transcribe_audio(self):
         """Capture audio and transcribe it in real-time."""
         with sr.Microphone() as source:
@@ -389,11 +470,18 @@ class JitsiBot:
         try:
             print("\nShutting down bot...")
             self.stop_transcription()  # Stop the transcription thread
-            self.stop_recording()
+                        
+            # Set a flag to stop recording (you'll need to add this as an instance variable)
+            self.stop_recording_flag = True
+            
+            if hasattr(self, 'recording_thread') and self.recording_thread.is_alive():
+                self.recording_thread.join(timeout=5)  # Wait up to 5 seconds for recording to finish
+                
             time.sleep(3)  # Give more time for the recording to save
             self.driver.quit()
             print("Bot shutdown complete")
         except Exception as e:
+            print(f"Error during shutdown: {e}")
             print("Bot shutdown complete (browser already closed)")
 
 def main():
